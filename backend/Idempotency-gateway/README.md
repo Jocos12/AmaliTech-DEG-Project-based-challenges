@@ -1,155 +1,200 @@
-# Idempotency-Gateway (The "Pay-Once" Protocol)
+# Idempotency Gateway
 
-This challenge is designed to test your ability to bridge Computer Science fundamentals with Modern Backend Engineering.
+FinSafe Transactions Ltd. needed a pay-once layer so that client retries after network timeouts do not charge a customer twice. This service is a Spring Boot REST API that accepts payment requests keyed by an `Idempotency-Key` header: the first request is processed and stored in MySQL, later retries with the same key and body replay the stored result, and a reused key with a different body is rejected.
 
-## 1. Business Context
+## Architecture Diagram
 
-> **Client:** _FinSafe Transactions Ltd._ (A fast-growing Payment Processor).
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Client
+    participant Gateway as Payment Gateway
+    participant Inflight as In-flight map (memory)
+    participant DB as MySQL (idempotency_records)
+    participant Processor as Payment processor
 
-### The Problem
+    Client->>Gateway: POST /process-payment<br/>Idempotency-Key + JSON body
+    Gateway->>Gateway: SHA-256 hash of canonical body
+    Gateway->>DB: SELECT by idempotency_key
 
-FinSafe's clients (e-commerce shops) occasionally experience network timeouts. When this happens, their servers automatically retry sending payment requests. Recently, this has led to a critical issue: **Double Charging**.
+    alt Stored key, same body (and not expired)
+        DB-->>Gateway: Cached status + JSON body
+        Gateway-->>Client: Same response + X-Cache-Hit: true
+    else Stored key, different body
+        DB-->>Gateway: Hash mismatch
+        Gateway-->>Client: 409 Conflict
+    else No stored record (or expired)
+        Gateway->>Inflight: putIfAbsent(key, future)
+        alt Another request already in flight (same body)
+            Inflight-->>Gateway: Existing CompletableFuture
+            Gateway->>Gateway: Wait until first request completes
+            Gateway-->>Client: Original result (no second charge)
+        else Another request in flight (different body)
+            Gateway-->>Client: 409 Conflict
+        else This request won the in-flight slot
+            Gateway->>Processor: Simulate charge (2s delay)
+            Processor-->>Gateway: Charged {amount} {currency}
+            Gateway->>DB: INSERT key, hash, status, body, created_at, expires_at
+            Note over Gateway,DB: Unique key constraint: duplicate insert is treated as a replay
+            Gateway->>Inflight: Complete future and remove key
+            Gateway-->>Client: 201 Created
+        end
+    end
+```
 
-If a customer clicks "Pay," the request is sent, but the network lags. The client retries the request. FinSafe processes _both_ requests, charging the customer twice. This is causing customer churn and regulatory headaches.
+Expired rows are ignored on read (and deleted) and removed by a scheduled purge so the table stays bounded.
 
-### The Solution
+## Setup Instructions
 
-FinSafe needs you to build an **Idempotency Layer**. This is a middleware service (or API) that ensures no matter how many times a client sends the same request, the payment is processed **exactly once**.
+**Prerequisites**
 
----
+- JDK 17 or later
+- Apache Maven 3.9+
+- MySQL 8 on port **3308**, or Docker for the bundled Compose file
 
-## 2. Technical Objective
+**1. Start MySQL**
 
-Build a RESTful API that mimics a payment processing backend. It must check for a unique `Idempotency-Key` in the HTTP headers.
+Option A — Docker (password comes from your environment):
 
-- **First Request:** Process the payment and save the response.
-- **Duplicate Request:** Detect the existing key and return the _saved_ response immediately, without processing the payment again.
+```bash
+# PowerShell
+$env:DB_PASSWORD="your_mysql_password_here"
+docker compose up -d
+```
 
----
+```bash
+# bash
+export DB_PASSWORD=your_mysql_password_here
+docker compose up -d
+```
 
-## 3. Getting Started
+Option B — existing local MySQL on `localhost:3308`. Create a user/root password you will export as `DB_PASSWORD`. The JDBC URL uses `createDatabaseIfNotExist=true`, so the `idempotency_gateway` schema is created if it is missing. Hibernate `ddl-auto=update` creates the `idempotency_records` table on first startup.
 
-1.  **Fork this Repository:** Do not clone it directly. Create a fork to your own GitHub account.
-2.  **Environment:** You may use **Node.js, Python, Java or Go, etc.**. You may use any database or in-memory store (Redis, SQLite, or a simple native Map/Dictionary variable).
-3.  **Submission:** Your final submission will be a link to your forked repository containing the source code and documentation.
+**2. Set `DB_PASSWORD` (required)**
 
----
+The app does not ship a default password. If the variable is missing, Spring fails fast (`Could not resolve placeholder 'DB_PASSWORD'`).
 
-## 4. The Architecture Diagram
+```bash
+# PowerShell (current session)
+$env:DB_PASSWORD="your_mysql_password_here"
 
-**Task:** Before you write any code, you must design the logic flow.
-**Deliverable:** A **Sequence Diagram** or **Flowchart** included in your README.
+# bash
+export DB_PASSWORD=your_mysql_password_here
+```
 
----
+In IntelliJ: Run → Edit Configurations → your Spring Boot run config → Environment variables → `DB_PASSWORD=...`.
 
-## 5. User Stories & Acceptance Criteria
+See `.env.example` for the variable name. Do not commit a real `.env` file.
 
-### User Story 1: The First Transaction (Happy Path)
+**3. Run the API**
 
-**As a** client system (e.g., an online store),
-**I want to** send a payment request with a unique ID,
-**So that** my transaction is processed successfully.
+```bash
+mvn spring-boot:run
+```
 
-**Acceptance Criteria:**
+The server listens on **http://localhost:8080**. Processing delay (2 seconds) and key TTL (24 hours) are set in `src/main/resources/application.properties`.
 
-- [ ] The API accepts a `POST` request to endpoint `/process-payment`.
-- [ ] The request header must contain `Idempotency-Key: <some-unique-string>`.
-- [ ] The request body accepts a JSON object (e.g., `{"amount": 100, "currency": "GHS"}`).
-- [ ] The server simulates processing (e.g., a 2-second delay) and returns a `200 OK` or `201 Created` response.
-- [ ] The response body should include a status message: `"Charged 100 GHS"`.
+## API Documentation
 
-### User Story 2: The Duplicate Attempt (Idempotency Logic)
+### `POST /process-payment`
 
-**As a** client system,
-**I want to** safely retry a request if I don't hear back,
-**So that** I don't accidentally double-charge the user.
+| Item | Value |
+|------|--------|
+| Header | `Idempotency-Key` (required) |
+| Body | `{ "amount": 100, "currency": "GHS" }` |
+| Content-Type | `application/json` |
 
-**Acceptance Criteria:**
+#### 1. First request (happy path)
 
-- [ ] If the client sends a second `POST` request with the **same** `Idempotency-Key` and payload:
-  - [ ] The server must **NOT** run the processing logic again (no 2-second delay).
-  - [ ] The server must return the **exact same** response body and status code as the first successful request.
-  - [ ] The server returns a header `X-Cache-Hit: true` to indicate this was a replayed response.
+Processing sleeps for two seconds, then persists the outcome in MySQL.
 
-### User Story 3: Different Request, Same Key (Fraud/Error Check)
+```bash
+curl -i -X POST http://localhost:8080/process-payment \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: pay-001" \
+  -d "{\"amount\":100,\"currency\":\"GHS\"}"
+```
 
-**As a** security officer,
-**I want to** reject requests that reuse keys for different payments,
-**So that** we maintain data integrity.
+**201 Created**
 
-**Acceptance Criteria:**
+```json
+{ "status": "Charged 100 GHS" }
+```
 
-- [ ] If a request arrives with an existing `Idempotency-Key` but a **different** request body (e.g., changing amount from 100 to 500):
-  - [ ] The server must return a `422 Unprocessable Entity` or `409 Conflict` error.
-  - [ ] The error message should state: `"Idempotency key already used for a different request body."`
+#### 2. Duplicate request (same key, same body)
 
----
+No processing delay. Same status and body as the original.
 
-## 6. Bonus User Story (The "In-Flight" Check)
+```bash
+curl -i -X POST http://localhost:8080/process-payment \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: pay-001" \
+  -d "{\"amount\":100,\"currency\":\"GHS\"}"
+```
 
-**As a** system architect,
-**I want to** handle cases where two identical requests arrive at the exact same time,
-**So that** we don't succumb to race conditions.
+**201 Created** with header `X-Cache-Hit: true`
 
-**Scenario:** Request A arrives. While Request A is still "processing" (during the 2-second delay), Request B (same key) arrives.
+```json
+{ "status": "Charged 100 GHS" }
+```
 
-**Acceptance Criteria:**
+#### 3. Conflict (same key, different body)
 
-- [ ] Request B should not start a new process.
-- [ ] Request B should not return `409 Conflict`.
-- [ ] Request B should wait (block) until Request A finishes, and then return the result of Request A.
+```bash
+curl -i -X POST http://localhost:8080/process-payment \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: pay-001" \
+  -d "{\"amount\":500,\"currency\":\"GHS\"}"
+```
 
----
+**409 Conflict**
 
-## 7. The "Developer's Choice" Challenge
+```json
+{ "error": "Idempotency key already used for a different request body." }
+```
 
-We believe great engineers are also product thinkers.
+#### 4. In-flight wait (same key while the first request is still processing)
 
-**Task:** Identify **one** additional feature or safety mechanism that would make this system better for a real-world Fintech company.
+Send two identical requests at the same time. Request B must not start a second charge and must not return 409. It waits on the same in-memory `CompletableFuture` and returns Request A's 201 body after processing finishes. Only the completed result is written to MySQL.
 
-1.  **Implement it.**
-2.  **Document it:** Explain _why_ you added it in your README.
+```bash
+curl -i -X POST http://localhost:8080/process-payment \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: pay-inflight" \
+  -d "{\"amount\":100,\"currency\":\"GHS\"}" &
+curl -i -X POST http://localhost:8080/process-payment \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: pay-inflight" \
+  -d "{\"amount\":100,\"currency\":\"GHS\"}" &
+wait
+```
 
----
+#### Other errors
 
-## 8. Documentation Requirements
+Missing `Idempotency-Key` or malformed JSON → **400 Bad Request** with `{ "error": "..." }`.
 
-Your final `README.md` must replace these instructions. It must cover:
+## Design Decisions
 
-1.  **Architecture Diagram**
-2.  **Setup Instructions**
-3.  **API Documentation**
-4.  **Design Decisions**
-5.  **The Developer's Choice:** Description of the extra feature you added.
+**MySQL + Spring Data JPA for completed records.** Idempotency keys must survive process restarts. A payment processor also needs an audit trail (who charged what, with which key). Hibernate `ddl-auto=update` creates `idempotency_records` automatically. A unique constraint on `idempotency_key` is the last line of defence if two JVMs both try to insert the same key; `DataIntegrityViolationException` is turned into a replay of the row that won the insert.
 
----
+**In-memory `ConcurrentHashMap` + `CompletableFuture` for in-flight work only.** While a charge is still in the 2-second simulation, there is no row yet. Concurrent retries on the same instance share one future via `putIfAbsent`. That state is useless after the HTTP calls finish, so it stays in memory. Completed responses live in MySQL.
 
-Submit your repo link via the [online](https://forms.cloud.microsoft/e/bLyGT3byxx) form.
+**SHA-256 of a canonical body.** Amount is normalized (`stripTrailingZeros`) and currency is trimmed and upper-cased before hashing. The table stores the hash, not a brittle JSON string compare, so `100` and `100.0` are the same payment. A hash mismatch is a 409 conflict.
 
----
+**Why not Redis-only.** Redis is excellent for hot idempotency windows in a multi-node cluster. This service uses MySQL because reviewers can inspect rows with SQL, the data model matches a typical fintech ledger sidecar, and JPA keeps the code portable. A production cluster might add Redis in front for sub-millisecond lookups and still persist to MySQL.
 
-## 🛑 Pre-Submission Checklist
+## The Developer's Choice
 
-**WARNING:** Before you submit your solution, you **MUST** pass every item on this list.
-If you miss any of these critical steps, your submission will be **automatically rejected** and you will **NOT** be invited to an interview.
+**TTL / automatic key expiry.** Keys expire after `idempotency.key.ttl-hours` (default **24 hours**). `expires_at` is stored on each row. Reads skip (and delete) expired rows; a `@Scheduled` job runs `DELETE ... WHERE expires_at < now` on `idempotency.purge-interval-ms` (default 1 hour).
 
-### 1. 📂 Repository & Code
+Stripe, PayPal, and similar APIs treat idempotency keys as valid only inside a window (often 24 hours). After that, the same key may be reused and the table stays bounded.
 
-- [ ] **Public Access:** Is your GitHub repository set to **Public**? (We cannot review private repos).
-- [ ] **Clean Code:** Did you remove unnecessary files (like `node_modules`, `.env` with real keys, or `.DS_Store`)?
-- [ ] **Run Check:** if we clone your repo and run `npm start` (or equivalent), does the server start immediately without crashing?
+## Testing
 
-### 2. 📄 Documentation (Crucial)
+```bash
+mvn test
+```
 
-- [ ] **Architecture Diagram:** Did you include a visual Diagram (Flowchart or Sequence Diagram) in the README?
-- [ ] **README Swap:** Did you **DELETE** the original instructions (the problem brief) from this file and replace it with your own documentation?
-- [ ] **API Docs:** Is there a clear list of Endpoints and Example Requests in the README?
-
-### 3. 🧹 Git Hygiene
-
-- [ ] **Commit History:** Does your repo have multiple commits with meaningful messages? (A single "Initial Commit" is a red flag).
-
----
-
-**Ready?**
-If you checked all the boxes above, submit your repository link in the application form. Good luck! 🚀
+- Unit tests (`PaymentServiceTest`) mock `IdempotencyRecordRepository` and cover new key, duplicate replay, hash conflict, unique-constraint races, and concurrent in-flight sharing of a single charge.
+- Scheduler tests verify the purge job calls `deleteByExpiresAtBefore`.
+- Integration tests (`PaymentControllerIntegrationTest`) use **Testcontainers MySQL** so reviewers do not need a local database. Docker must be running. Tests use a 200ms processing delay via `src/test/resources/application.properties`.
