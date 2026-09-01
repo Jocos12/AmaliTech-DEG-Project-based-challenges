@@ -198,3 +198,17 @@ mvn test
 - Unit tests (`PaymentServiceTest`) mock `IdempotencyRecordRepository` and cover new key, duplicate replay, hash conflict, unique-constraint races, and concurrent in-flight sharing of a single charge.
 - Scheduler tests verify the purge job calls `deleteByExpiresAtBefore`.
 - Integration tests (`PaymentControllerIntegrationTest`) use **Testcontainers MySQL** so reviewers do not need a local database. Docker must be running. Tests use a 200ms processing delay via `src/test/resources/application.properties`.
+
+## Future Improvements
+
+If this service were to move toward production scale, here are the next steps I'd prioritize:
+
+- **Redis-backed hot cache**: Move active idempotency keys to Redis with a short TTL, keeping MySQL as the durable source of truth. This would reduce read latency for high-traffic clients while preserving auditability.
+
+- **Rate limiting per client**: Add a rate limiter (e.g., token bucket) keyed by client ID to prevent abuse of the idempotency endpoint, since a malicious or buggy client could otherwise flood the system with unique keys.
+
+- **Distributed in-flight locking**: The current in-flight map only works within a single instance. In a multi-node deployment, this should be replaced with a distributed lock (e.g., Redis SETNX or a database-backed lock) so concurrent requests are correctly serialized across nodes.
+
+- **Metrics and observability**: Expose Prometheus metrics for cache hit rate, conflict rate, and average processing time, to help operators spot anomalies (e.g., a spike in 409 Conflicts could indicate a client-side bug).
+
+- **Configurable key hashing algorithm**: Allow swapping SHA-256 for a different hash function via configuration, in case future compliance requirements dictate a specific algorithm.
